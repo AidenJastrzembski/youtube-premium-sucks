@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use std::{fs, path::PathBuf, process::Command};
+use std::{fs, io::Write, net::TcpListener, path::PathBuf, process::Command, time::SystemTime};
 
 /*
 *
@@ -30,6 +30,10 @@ struct Args {
     /// Download audio only (extracts best available audio)
     #[arg(short = 'a', long)]
     audio_only: bool,
+
+    /// Serve the downloaded file over LAN
+    #[arg(long)]
+    serve: bool,
 }
 
 fn main() -> Result<()> {
@@ -42,7 +46,7 @@ fn main() -> Result<()> {
     cmd.arg(&args.url);
 
     // throw on the output template if given
-    if let Some(out) = args.output {
+    if let Some(out) = args.output.clone() {
         cmd.args(["-o", &out]);
     }
 
@@ -60,7 +64,101 @@ fn main() -> Result<()> {
     let status = cmd.status().context("Failed to execute yt-dlp")?;
     if !status.success() {
         eprintln!("yt-dlp failed with exit code {:?}", status.code());
+        return Ok(());
     }
+
+    // If the user requested to serve the file over LAN
+    if args.serve {
+        // Determine which file to serve
+        let output_path = determine_output_path(&args)?;
+
+        serve_over_lan(&output_path)?;
+    }
+
+    Ok(())
+}
+
+/// Try to find the output file path to serve
+fn determine_output_path(args: &Args) -> Result<PathBuf> {
+    if let Some(template) = &args.output {
+        let path = PathBuf::from(template);
+        if path.exists() {
+            return Ok(path);
+        }
+        let fallback = std::env::current_dir()?.join(template);
+        if fallback.exists() {
+            return Ok(fallback);
+        }
+    }
+
+    // If no output given, try to find the most recently modified media file
+    let mut latest: Option<(PathBuf, SystemTime)> = None;
+    for entry in fs::read_dir(".")? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_file() {
+            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                // crude heuristic for media files
+                if ["mp3", "mp4", "m4a", "webm", "opus"].contains(&ext) {
+                    let modified = entry.metadata()?.modified()?;
+                    if latest.as_ref().map_or(true, |(_, t)| modified > *t) {
+                        latest = Some((path, modified));
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some((path, _)) = latest {
+        Ok(path)
+    } else {
+        anyhow::bail!("Could not determine downloaded file to serve")
+    }
+}
+
+/// Serves the specified file on the local network via HTTP
+fn serve_over_lan(file_path: &PathBuf) -> Result<()> {
+    println!("\nStarting LAN share...");
+
+    // Try to read the file
+    let file_data =
+        fs::read(file_path).with_context(|| format!("Failed to read file {:?}", file_path))?;
+
+    // Bind a simple TCP listener on port 42069 to all interfaces
+    let listener = TcpListener::bind("0.0.0.0:42069").context("Failed to bind to port 42069")?;
+
+    // let output = Command::new("hostname")
+    //     .arg("-i")
+    //     .output()
+    //     .context("Failed to get IP")?;
+    // let ip = String::from_utf8_lossy(&output.stdout)
+    //     .split_whitespace()
+    //     .next()
+    //     .unwrap()
+    //     .to_string();
+
+    println!(
+        "Serving {:?} on http://0.0.0.0:42069\n\nUse Ctrl+C to stop.",
+        file_path.file_name().unwrap_or_default(),
+    );
+
+    // println!(
+    //     "Serving {:?} on http://{:?}:42069\n\nUse Ctrl+C to stop.",
+    //     file_path.file_name().unwrap_or_default(),
+    //     ip
+    // );
+
+    // Wait for one incoming connection, serve the file, then exit.
+    let (mut stream, peer_addr) = listener
+        .accept()
+        .context("Failed to accept incoming connection")?;
+    println!("Client connected from {}", peer_addr);
+
+    // Write a minimal HTTP response and the file contents
+    stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\r\n")?;
+    stream.write_all(&file_data)?;
+    stream.flush()?;
+    println!("File served to client.");
 
     Ok(())
 }
